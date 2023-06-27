@@ -11,3 +11,5 @@ The main idea is quite simple:
 - we replace podman´s binary `/usr/bin/podman` for a shell script, thus, when MergeStat executes podman, it is actually executing the shell script;
 - The shell script executes a python script, passing to it all command line arguments it received from MergeStat;
 - The shell script executes MergeStat sync containers by creating Jobs through the Kubernetes API.
+
+To get all the details, start with the `Dockerfile` file, then the `podman` file and, finally, the `podman.py` file.
