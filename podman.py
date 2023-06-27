@@ -1,128 +1,24 @@
 from datetime import datetime
 from dotenv import dotenv_values
 from json import dumps
-from kubernetes import client, config
-from kubernetes.watch import Watch
-from os import getenv, geteuid, path
-from sys import argv, exit, stderr
+from kubernetes import config, client
+from kubernetes.client.rest import ApiException
+from os import getenv, geteuid
+from sys import argv, exit
+from time import sleep
 
-def get_namespace():
-    namespace_path = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-    if path.isfile(namespace_path):
-        with open(namespace_path, "r") as namespace_file:
-            namespace = namespace_file.read().strip()
-            return namespace
-    else:
-        return None
+def log(message):
+    with open("/tmp/podman.log", "a") as log_file:
+        print(message, file = log_file)
 
-
-class VolumeMapping:
-    def __init__(self, claim_name, mount_path, sub_path=None):
-        self.claim_name = claim_name
-        self.mount_path = mount_path
-        self.sub_path = sub_path
-
-def create_job(namespace, job_name, image, command, env_vars, cpu_limit, memory_limit, cpu_request, memory_request, volume_mappings, run_as_user=None, ttl_seconds_after_finished=None):
-    # Inicializa automaticamente o cliente do Kubernetes com base nas informações do ambiente do pod
-    config.load_incluster_config()
-
-    # Cria uma instância do cliente do Kubernetes
-    batch_v1 = client.BatchV1Api()
-
-    # Define o objeto de especificação do Job
-    job = client.V1Job()
-    job.api_version = "batch/v1"
-    job.kind = "Job"
-    job.metadata = client.V1ObjectMeta(name=job_name, namespace=namespace)
-
-    # Define o container no Job
-    container = client.V1Container(name="my-container", image=image, command=command)
-
-    # Configura as variáveis de ambiente
-    env = [client.V1EnvVar(name=k, value=v) for k, v in env_vars.items()]
-    container.env = env
-
-    # Configura os limites e solicitações de CPU e memória
-    resources = client.V1ResourceRequirements()
-    resources.limits = {"cpu": cpu_limit, "memory": memory_limit}
-    resources.requests = {"cpu": cpu_request, "memory": memory_request}
-    container.resources = resources
-
-    # Define os volumes e os volume mounts
-    volume_mounts = []
-    volumes = []
-
-    for volume_mapping in volume_mappings:
-        volume_mount = client.V1VolumeMount(
-            name=volume_mapping.claim_name,
-            mount_path=volume_mapping.mount_path,
-            sub_path=volume_mapping.sub_path,
-        )
-        volume_mounts.append(volume_mount)
-
-        volume = client.V1Volume(
-            name=volume_mapping.claim_name,
-            persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
-                claim_name=volume_mapping.claim_name
-            ),
-        )
-        volumes.append(volume)
-
-    container.volume_mounts = volume_mounts
-
-    # Define o template do pod
-    template = client.V1PodTemplateSpec()
-    template.spec = client.V1PodSpec(
-        containers=[container],
-        volumes=volumes,
-        restart_policy="Never",
-        security_context=client.V1PodSecurityContext(run_as_user=run_as_user),
-    )
-
-    # Define o spec do Job
-    job.spec = client.V1JobSpec(template=template, backoff_limit=0, ttl_seconds_after_finished=ttl_seconds_after_finished)
-
-    print(job, file = stderr)
-
-    try:
-        # Cria o Job no namespace especificado
-        batch_v1.create_namespaced_job(namespace, job)
-        print("Job criado com sucesso.", file = stderr)
-    except client.ApiException as e:
-        print("Erro ao criar o Job: %s" % e, file = stderr)
-        return
-
-    # Aguarda a conclusão do Job
-    w = Watch()
-
-    try:
-        for event in w.stream(batch_v1.list_namespaced_job, namespace=namespace):
-            job_event = event['object']
-            if job_event.metadata.name == job_name:
-                status = job_event.status
-                print(status, file = stderr)
-
-                if status.succeeded:
-                    print("Job concluído com sucesso.", file = stderr)
-                    w.stop()
-                elif status.failed:
-                    print("Job falhou.", file = stderr)
-                    w.stop()
-    except Exception as e:
-        print("Erro ao acompanhar o Job: %s" % e, file = stderr)
-
-
-
-print(argv, file = stderr)
-
-#['/usr/bin/podman.py', 'pull', 'docker://ghcr.io/mergestat/sync-mergestat-explore:latest']
-if (len(argv) == 3 and argv[1] == "pull"):
+def pull():
+    # Does nothing. 
     exit(0)
 
-elif (len(argv) == 4
-        and argv[1] == "image"
-        and argv[2] == "inspect"):
-    image = argv[3]
+def inspect():
+    # Since this script does not pull images, it is not able to inspect them.
+    # Thus, it always returns the "com.mergestat.sync.clone" label,
+    # forcing MergeStat to clone git repositories, even when it is not necessary.
     result = [
         {
             "Labels": {
@@ -133,8 +29,156 @@ elif (len(argv) == 4
     print(dumps(result, indent=4)) 
     exit(0)
 
-#['/usr/bin/podman.py', 'run', '--quiet', '--rm', '--restart', 'on-failure', '--pull', 'never', '--env-file', '/tmp/mergestat-3248512259', '--network', 'host', '-v', '/git/mergestat-repo-45a8cedd-22b4-4fd7-a602-85b2466f361c-3371057527:/mergestat/repo', 'docker://ghcr.io/mergestat/sync-mergestat-explore:latest']
-elif (len(argv) == 15
+class PVCMapping:
+    def __init__(self, claim_name, sub_path, mount_path):
+        self.claim_name = claim_name
+        self.sub_path = sub_path    
+        self.mount_path = mount_path
+
+def create_job(backoff_limit,
+               command,
+               container_name,
+               cpu_limit, 
+               cpu_request, 
+               env,
+               image,
+               job_name,
+               memory_limit, 
+               memory_request,
+               pvc_mappings,
+               restart_policy, 
+               run_as_user,
+               ttl_seconds_after_finished):
+    # Get namespace in which this script is executing
+    with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as namespace_file:
+        namespace = namespace_file.read()
+
+    # Create a job with the supplied settings
+    object_meta = client.V1ObjectMeta(name = job_name)
+    env = [client.V1EnvVar(name = name, value = value) for name, value in env.items()]
+    limits = {"cpu": cpu_limit, "memory": memory_limit}
+    requests = {"cpu": cpu_request, "memory": memory_request}
+    resource_requirements = client.V1ResourceRequirements(limits = limits, requests = requests)
+    volume_mounts = [client.V1VolumeMount(name = p.claim_name, mount_path = p.mount_path, sub_path = p.sub_path) for p in pvc_mappings]
+    container = client.V1Container(command = command, env = env, image = image, name = container_name, resources = resource_requirements, volume_mounts = volume_mounts) 
+    pod_security_context = client.V1PodSecurityContext(run_as_user = run_as_user)
+    volumes = [client.V1Volume(name = p.claim_name, persistent_volume_claim = client.V1PersistentVolumeClaimVolumeSource(claim_name = p.claim_name)) for p in pvc_mappings]
+    pod_spec = client.V1PodSpec(containers = [container], restart_policy = restart_policy, security_context = pod_security_context, volumes = volumes)
+    pod_template_spec = client.V1PodTemplateSpec(spec = pod_spec)
+    job_spec = client.V1JobSpec(backoff_limit = backoff_limit, template = pod_template_spec, ttl_seconds_after_finished = ttl_seconds_after_finished)
+    job = client.V1Job(metadata = object_meta, spec = job_spec)
+
+    config.load_incluster_config()
+
+    batch_api = client.BatchV1Api()
+    batch_api.create_namespaced_job(namespace = namespace, body = job)
+
+    # Wait for the job´s end
+    while True:
+        job = batch_api.read_namespaced_job(namespace = namespace, name = job_name)
+        if job.status.failed == 1 or job.status.succeeded == 1:
+            break
+        else:
+            sleep(1)
+
+    # Copy job´s stdout
+    core_api = client.CoreV1Api()
+    pods = core_api.list_namespaced_pod(namespace = namespace, label_selector = f"job-name={job_name}")
+    if pods.items:
+        pod_name = pods.items[0].metadata.name
+        pod_log = core_api.read_namespaced_pod_log(namespace = namespace, name = pod_name, container = container_name, follow = False)
+        print(pod_log)
+
+        # Exit with the same exit code of the job
+        pod = core_api.read_namespaced_pod(namespace = namespace, name = pod_name)
+        exit_code = pod.status.container_statuses[0].state.terminated.exit_code
+        exit(exit_code)
+
+    # Exit anyway
+    exit(1)
+
+def run():
+    backoff_limit = 0
+    command = None
+    container_name = "container"
+    cpu_limit = getenv("CPU_LIMIT", "250m")
+    cpu_request = getenv("CPU_REQUEST", "250m")
+    env = dotenv_values(argv[9])
+    image = argv[-1][len("docker://"):]
+    job_name = "mergestat-" + datetime.now().strftime("%m-%d-%Y-%H-%M-%S-%f")
+    memory_limit = getenv("MEMORY_LIMIT", "256Mi")
+    memory_request = getenv("MEMORY_REQUEST", "256Mi")
+
+    pvc_mappings = getenv("PVC_MAPPINGS", "")
+    pvc_mappings = pvc_mappings.split(",")
+    pvc_mappings = [p.split(":") for p in pvc_mappings]
+    pvc_mappings = [PVCMapping(claim_name = p[0], sub_path = None, mount_path = p[1]) for p in pvc_mappings]
+
+    if len(argv) == 15:
+        claim_name = getenv("GIT_PVC")
+
+        git_clone_path = getenv("GIT_CLONE_PATH")
+        git_clone_path_len = len(git_clone_path)
+        sub_path = argv[13]
+        sub_path = sub_path.split(":")
+        sub_path = sub_path[0]
+        sub_path = sub_path[git_clone_path_len + 1:]
+
+        pvc_mapping = PVCMapping(claim_name = claim_name, sub_path = sub_path, mount_path = "/mergestat/repo")
+
+        pvc_mappings.append(pvc_mapping)
+
+    restart_policy = "Never"
+    run_as_user = geteuid()
+    ttl_seconds_after_finished = getenv("TTL_SECONDS_AFTER_FINISHED", 1800)
+
+    create_job(backoff_limit = backoff_limit,
+               command = command, 
+               container_name = container_name,
+               cpu_limit = cpu_limit, 
+               cpu_request = cpu_request,
+               env = env,
+               pvc_mappings = pvc_mappings,
+               memory_limit = memory_limit, 
+               memory_request = memory_request, 
+               image = image, 
+               job_name = job_name,
+               restart_policy = restart_policy,
+               run_as_user = run_as_user, 
+               ttl_seconds_after_finished = ttl_seconds_after_finished)               
+
+def unexpected():
+    log(f"Unexpected command line: {argv}")
+    exit(1)
+
+def main():
+    #['/usr/bin/podman.py', 'pull', 'docker://publicaveis-docker.repo.bcnet.bcb.gov.br/dides/nexos-mergestat-maven-bacen:20230627094416935']
+    if (len(argv) == 3
+            and argv[1] == "pull"):
+        pull()
+
+    #['/usr/bin/podman.py', 'image', 'inspect', 'publicaveis-docker.repo.bcnet.bcb.gov.br/dides/nexos-mergestat-maven-bacen:20230627094416935']
+    elif (len(argv) == 4
+            and argv[1] == "image"
+            and argv[2] == "inspect"):
+        inspect()
+
+    #['/usr/bin/podman.py', 'run', '--quiet', '--rm', '--restart', 'on-failure', '--pull', 'never', '--env-file', '/tmp/mergestat-798915348', '--network', 'host', 'docker://publicaveis-docker.repo.bcnet.bcb.gov.br/dides/nexos-mergestat-maven-bacen:20230627094416935']
+    elif (len(argv) == 13
+        and argv[1] == "run"
+        and argv[2] == "--quiet"
+        and argv[3] == "--rm"
+        and argv[4] == "--restart"
+        and argv[5] == "on-failure"
+        and argv[6] == "--pull"
+        and argv[7] == "never"
+        and argv[8] == "--env-file"
+        and argv[10] == "--network"
+        and argv[11] == "host"):
+        run()
+
+    #['/usr/bin/podman.py', 'run', '--quiet', '--rm', '--restart', 'on-failure', '--pull', 'never', '--env-file', '/tmp/mergestat-2251375782', '--network', 'host', '-v', '/git/mergestat-repo-9daf4648-b800-4f20-91ab-13a14d6a73d9-115409061:/mergestat/repo', 'docker://publicaveis-docker.repo.bcnet.bcb.gov.br/dides/nexos-mergestat-maven-bacen:20230627094416935']
+    elif (len(argv) == 15
         and argv[1] == "run"
         and argv[2] == "--quiet"
         and argv[3] == "--rm"
@@ -146,48 +190,9 @@ elif (len(argv) == 15
         and argv[10] == "--network"
         and argv[11] == "host"
         and argv[12] == "-v"):
-    #print(argv[13], file = stderr)
-    #print(argv[13].split(":"), file = stderr)
-    #print(argv[13].split(":")[0], file = stderr)
-    #print(argv[13].split(":")[0][len(git_clone_path) + 1:], file = stderr)
+        run()
 
-    namespace = get_namespace()
-    job_name = "mergestat-" + datetime.now().strftime("%m-%d-%Y-%H-%M-%S-%f")
-    image = argv[14][len("docker://"):]
-    command = None #["tail", "-f",  "/dev/null"]
+    else:
+        unexpected()
 
-    env_vars = dotenv_values(argv[9])
-    
-    cpu_limit = getenv("CPU_LIMIT", "250m")
-    memory_limit = getenv("MEMORY_LIMIT", "256Mi")
-    cpu_request = getenv("CPU_REQUEST", "250m")
-    memory_request = getenv("MEMORY_REQUEST", "256Mi")
-
-    git_clone_path = getenv("GIT_CLONE_PATH", "/git")
-
-    mergestat_claim_name = getenv("MERGESTAT_CLAIM_NAME", "mergestat-git-pvc")
-    mergestat_mount_path = getenv("MERGESTAT_MOUNT_PATH", "/mergestat/repo")
-    mergestat_sub_path = argv[13].split(":")[0][len(git_clone_path) + 1:]
-
-    trivy_claim_name = getenv("TRIVY_CLAIM_NAME", "mergestat-trivy-pvc")
-    trivy_mount_path = getenv("TRIVY_MOUNT_PATH", "/trivy")
-
-    maven_claim_name = getenv("MAVEN_CLAIM_NAME", "maven-git-pvc")
-    maven_mount_path = getenv("MAVEN_MOUNT_PATH", "/maven")
-
-    volume_mappings = [
-        VolumeMapping(mergestat_claim_name, mergestat_mount_path, mergestat_sub_path),
-        VolumeMapping(trivy_claim_name, trivy_mount_path),
-        VolumeMapping(maven_claim_name, maven_mount_path),
-    ]
-
-    run_as_user = geteuid()
-
-    ttl_seconds_after_finished = getenv("TTL_SECONDS_AFTER_FINISHED", 1800)
-
-    create_job(namespace, job_name, image, command, env_vars, cpu_limit, memory_limit, cpu_request, memory_request, volume_mappings, run_as_user, ttl_seconds_after_finished)
-    exit(0)
-
-else:
-    print(f"Unexpected command line: {argv}", file = stderr)
-    exit(126)
+main()
